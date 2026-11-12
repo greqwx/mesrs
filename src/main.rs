@@ -81,7 +81,8 @@ fn run() -> io::Result<()> {
         out,
         terminal::EnterAlternateScreen,
         cursor::Show,
-        event::EnableMouseCapture
+        event::EnableMouseCapture,
+        event::EnableBracketedPaste
     )?;
 
     let net_stop = Arc::clone(&stop);
@@ -111,6 +112,7 @@ fn restore_terminal() {
     let _ = execute!(
         out,
         cursor::Show,
+        event::DisableBracketedPaste,
         event::DisableMouseCapture,
         terminal::LeaveAlternateScreen
     );
@@ -123,7 +125,7 @@ fn print_help() {
     println!();
     println!("  group-code   exactly 6 digits, everyone with the same code talks together");
     println!();
-    println!("keys: enter sends, up/down and pgup/pgdn scroll, ctrl+c quits");
+    println!("keys: enter sends, arrows move the cursor, up/down recall, pgup/pgdn scroll, ctrl+c quits");
 }
 
 /// asks until a valid code is typed, None means stdin is closed

@@ -23,7 +23,8 @@ use crossterm::{cursor, queue};
 use crate::protocol::{NetEvent, OutCmd, parse_code};
 use crate::shutdown;
 use crate::text::{
-    MAX_TEXT, clean_text, cut, fit, mentions, sanitize_nick, tail_fit, visible_width, wrap,
+    MAX_TEXT, clean_text, cut, fit, mentions, one_line, sanitize_nick, tail_fit, visible_width,
+    wrap,
 };
 
 /// how long the ui sleeps between checks of the network channel
@@ -32,6 +33,8 @@ const POLL: Duration = Duration::from_millis(100);
 const MAX_LINES: usize = 1000;
 /// two clicks on the same row closer than this start a reply
 const DOUBLE_CLICK: Duration = Duration::from_millis(450);
+/// how many sent lines the up arrow can bring back
+const MAX_HISTORY: usize = 100;
 /// longest quote sent along with a reply, keeps the packet small
 const QUOTE_W: usize = 80;
 /// background of the row under the mouse, a couple of shades above black so
@@ -146,6 +149,14 @@ pub struct App {
     /// ids of messages already shown, udp can deliver a datagram twice
     seen: HashSet<String>,
     input: String,
+    /// byte offset into `input`, always on a character boundary
+    cursor: usize,
+    /// lines sent before, newest last
+    history: Vec<String>,
+    /// position in `history` while browsing, None means not browsing
+    hist_idx: Option<usize>,
+    /// what was typed before the first up arrow, restored on the way back
+    draft: String,
     /// wrapped lines scrolled up from the newest message, 0 means bottom
     scroll: usize,
     /// peer id and nickname, the id keeps the colour stable
@@ -174,6 +185,10 @@ impl App {
             lines: Vec::new(),
             seen: HashSet::new(),
             input: String::new(),
+            cursor: 0,
+            history: Vec::new(),
+            hist_idx: None,
+            draft: String::new(),
             scroll: 0,
             peers: Vec::new(),
             topic: String::new(),
@@ -217,6 +232,148 @@ impl App {
 
     fn push_system(&mut self, text: String) {
         self.push_msg(text, Style::System);
+    }
+
+    /// inserts text at the cursor, dropping whatever does not fit in `MAX_TEXT`
+    fn insert_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let room = MAX_TEXT.saturating_sub(self.input.chars().count());
+        if room == 0 {
+            return;
+        }
+        let insert: String = text.chars().take(room).collect();
+        self.input.insert_str(self.cursor, &insert);
+        self.cursor += insert.len();
+        self.hist_idx = None;
+        self.dirty = true;
+    }
+
+    fn char_before(&self) -> Option<usize> {
+        self.input[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(at, _)| at)
+    }
+
+    fn char_after(&self) -> Option<usize> {
+        self.input[self.cursor..]
+            .chars()
+            .next()
+            .map(|ch| self.cursor + ch.len_utf8())
+    }
+
+    fn backspace(&mut self) {
+        if let Some(prev) = self.char_before() {
+            self.input.replace_range(prev..self.cursor, "");
+            self.cursor = prev;
+            self.hist_idx = None;
+            self.dirty = true;
+        }
+    }
+
+    fn delete_forward(&mut self) {
+        if let Some(next) = self.char_after() {
+            self.input.replace_range(self.cursor..next, "");
+            self.hist_idx = None;
+            self.dirty = true;
+        }
+    }
+
+    /// start of the word before the cursor, whitespace dropped first
+    fn word_left(&self) -> usize {
+        let mut chars = self.input[..self.cursor].char_indices().rev().peekable();
+        let mut at = self.cursor;
+        while let Some(&(i, ch)) = chars.peek() {
+            if !ch.is_whitespace() {
+                break;
+            }
+            at = i;
+            chars.next();
+        }
+        while let Some(&(i, ch)) = chars.peek() {
+            if ch.is_whitespace() {
+                break;
+            }
+            at = i;
+            chars.next();
+        }
+        at
+    }
+
+    /// where the word after the cursor ends
+    fn word_right(&self) -> usize {
+        let mut at = self.cursor;
+        for (i, ch) in self.input[self.cursor..].char_indices() {
+            if ch.is_whitespace() {
+                break;
+            }
+            at = self.cursor + i + ch.len_utf8();
+        }
+        at
+    }
+
+    /// removes the word before the cursor, the way ctrl+w does in a shell
+    fn delete_word(&mut self) {
+        let start = self.word_left();
+        if start < self.cursor {
+            self.input.replace_range(start..self.cursor, "");
+            self.cursor = start;
+            self.hist_idx = None;
+            self.dirty = true;
+        }
+    }
+
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+        self.hist_idx = None;
+        self.draft.clear();
+        self.dirty = true;
+    }
+
+    /// steps through sent lines, `back` is the up arrow
+    fn recall(&mut self, back: bool) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = match (back, self.hist_idx) {
+            (true, None) => {
+                self.draft = self.input.clone();
+                Some(self.history.len() - 1)
+            }
+            (true, Some(0)) => Some(0),
+            (true, Some(i)) => Some(i - 1),
+            (false, None) => None,
+            (false, Some(i)) if i + 1 < self.history.len() => Some(i + 1),
+            (false, Some(_)) => None,
+        };
+        match next {
+            Some(i) => {
+                self.input = self.history[i].clone();
+                self.cursor = self.input.len();
+                self.hist_idx = Some(i);
+            }
+            None => {
+                self.input = std::mem::take(&mut self.draft);
+                self.cursor = self.input.len();
+                self.hist_idx = None;
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// keeps a sent line for the up arrow, skipping repeats
+    fn remember(&mut self, line: &str) {
+        if self.history.last().map(String::as_str) != Some(line) {
+            self.history.push(line.to_string());
+            if self.history.len() > MAX_HISTORY {
+                self.history.remove(0);
+            }
+        }
+        self.hist_idx = None;
+        self.draft.clear();
     }
 
     fn peer_nicks(&self) -> Vec<&str> {
@@ -361,8 +518,27 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') | KeyCode::Char('q') => return true,
-                KeyCode::Char('u') => {
-                    self.input.clear();
+                KeyCode::Char('u') => self.clear_input(),
+                KeyCode::Char('w') => self.delete_word(),
+                KeyCode::Char('a') => {
+                    self.cursor = 0;
+                    self.dirty = true;
+                }
+                KeyCode::Char('e') => {
+                    self.cursor = self.input.len();
+                    self.dirty = true;
+                }
+                KeyCode::Char('k') => {
+                    self.input.truncate(self.cursor);
+                    self.hist_idx = None;
+                    self.dirty = true;
+                }
+                KeyCode::Left => {
+                    self.cursor = self.word_left();
+                    self.dirty = true;
+                }
+                KeyCode::Right => {
+                    self.cursor = self.word_right();
                     self.dirty = true;
                 }
                 _ => {}
@@ -372,13 +548,25 @@ impl App {
 
         match key.code {
             KeyCode::Char(c) => {
-                if self.input.chars().count() < MAX_TEXT {
-                    self.input.push(c);
-                    self.dirty = true;
-                }
+                let mut buf = [0u8; 4];
+                self.insert_text(c.encode_utf8(&mut buf));
             }
-            KeyCode::Backspace => {
-                self.input.pop();
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Delete => self.delete_forward(),
+            KeyCode::Left => {
+                self.cursor = self.char_before().unwrap_or(0);
+                self.dirty = true;
+            }
+            KeyCode::Right => {
+                self.cursor = self.char_after().unwrap_or(self.input.len());
+                self.dirty = true;
+            }
+            KeyCode::Home => {
+                self.cursor = 0;
+                self.dirty = true;
+            }
+            KeyCode::End => {
+                self.cursor = self.input.len();
                 self.dirty = true;
             }
             KeyCode::Tab => {
@@ -387,11 +575,11 @@ impl App {
             KeyCode::Enter => {
                 let raw = self.input.clone();
                 let text = clean_text(&raw);
-                self.input.clear();
-                self.dirty = true;
+                self.clear_input();
                 if text.is_empty() {
                     return false;
                 }
+                self.remember(&raw);
                 if text.starts_with('/') {
                     let quit = self.handle_command(&text, tx);
                     self.scroll = 0;
@@ -406,15 +594,18 @@ impl App {
                 self.push_line(format!("{}: {}", self.nick, text), quote, Style::Own);
                 self.scroll = 0;
             }
-            // scroll offsets are counted from the newest line, up goes back
-            KeyCode::Up => {
+            // scroll offsets are counted from the newest line, up goes back;
+            // plain up and down belong to the input history
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.scroll += 1;
                 self.dirty = true;
             }
-            KeyCode::Down => {
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.scroll = self.scroll.saturating_sub(1);
                 self.dirty = true;
             }
+            KeyCode::Up => self.recall(true),
+            KeyCode::Down => self.recall(false),
             KeyCode::PageUp => {
                 self.scroll += 10;
                 self.dirty = true;
@@ -426,7 +617,7 @@ impl App {
             KeyCode::Esc => {
                 // esc drops the pending quote first, the input is the next thing
                 if self.reply.take().is_none() {
-                    self.input.clear();
+                    self.clear_input();
                 }
                 self.dirty = true;
             }
@@ -462,6 +653,7 @@ impl App {
 
         if let Some(text) = filled {
             self.input = text;
+            self.cursor = self.input.len();
             self.dirty = true;
         }
     }
@@ -516,6 +708,7 @@ impl App {
                         return Ok(());
                     }
                 }
+                Event::Paste(text) => self.insert_text(&one_line(&text)),
                 Event::Resize(_, _) => self.dirty = true,
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::Moved => {
@@ -669,7 +862,19 @@ impl App {
         };
         frame.push(Row::plain(fit(&hint, width), Style::Dim));
 
-        let tail = tail_fit(&self.input, width.saturating_sub(3));
+        // the input window follows the cursor: text before it is scrolled off
+        // when it no longer fits, whatever comes after takes the free columns
+        let input_w = width.saturating_sub(3).max(4);
+        let before = &self.input[..self.cursor];
+        let before_w = visible_width(before);
+        let (tail, cursor_col) = if before_w < input_w {
+            (cut(&self.input, input_w), before_w)
+        } else {
+            let tail = tail_fit(before, input_w.saturating_sub(1));
+            let used = visible_width(&tail);
+            let after = cut(&self.input[self.cursor..], input_w.saturating_sub(used));
+            (format!("{tail}{after}"), used)
+        };
         frame.push(Row::plain(format!("> {tail}"), Style::Input));
 
         queue!(out, cursor::MoveTo(0, 0))?;
@@ -705,7 +910,7 @@ impl App {
             }
         }
 
-        let cursor_x = 2 + visible_width(&tail);
+        let cursor_x = 2 + cursor_col;
         queue!(
             out,
             cursor::MoveTo(

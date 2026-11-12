@@ -51,6 +51,28 @@ pub fn clean_text(raw: &str) -> String {
     out.trim().to_string()
 }
 
+/// turns pasted text into one line: newlines and tabs become single spaces,
+/// other control characters are dropped
+pub fn one_line(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut gap = false;
+    for ch in raw.chars() {
+        if ch.is_whitespace() {
+            gap = true;
+            continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        if gap && !out.is_empty() {
+            out.push(' ');
+        }
+        gap = false;
+        out.push(ch);
+    }
+    out
+}
+
 /// true when `text` mentions `nick` as `@nick`
 ///
 /// the comparison ignores case and needs a clean boundary after the name, so
