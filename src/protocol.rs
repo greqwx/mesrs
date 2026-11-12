@@ -24,6 +24,9 @@ pub struct Packet {
     pub id: String,
     #[serde(default)]
     pub text: String,
+    /// line this message answers, empty when it is not a reply
+    #[serde(default)]
+    pub quote: String,
     /// group topic, carried by hello so newcomers learn it
     #[serde(default)]
     pub topic: String,
@@ -38,13 +41,17 @@ pub fn packet(peer: &str, nick: &str, kind: &str, id: &str, text: &str) -> Packe
         kind: kind.to_string(),
         id: id.to_string(),
         text: text.to_string(),
+        quote: String::new(),
         topic: String::new(),
     }
 }
 
 /// what the ui asks the network thread to do
 pub enum OutCmd {
-    Chat(String),
+    Chat {
+        text: String,
+        quote: String,
+    },
     Action(String),
     Nick(String),
     Topic(String),
@@ -58,6 +65,7 @@ pub struct PeerMessage {
     pub nick: String,
     pub id: String,
     pub text: String,
+    pub quote: String,
     pub action: bool,
 }
 

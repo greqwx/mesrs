@@ -8,11 +8,11 @@
 use std::collections::HashSet;
 use std::io::{self, Stdout, Write};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::style::{
     Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor,
@@ -28,6 +28,10 @@ use crate::text::{MAX_TEXT, clean_text, cut, fit, sanitize_nick, tail_fit, visib
 const POLL: Duration = Duration::from_millis(100);
 /// old lines are dropped past this point to keep memory flat
 const MAX_LINES: usize = 1000;
+/// two clicks on the same row closer than this start a reply
+const DOUBLE_CLICK: Duration = Duration::from_millis(450);
+/// longest quote sent along with a reply, keeps the packet small
+const QUOTE_W: usize = 80;
 /// background of the row under the mouse, a couple of shades above black so
 /// it reads as a hint rather than a selection
 const HOVER_BG: Color = Color::Rgb {
@@ -87,7 +91,20 @@ const COMMANDS: [Command; 8] = [
 ];
 
 struct ChatMsg {
+    seq: u64,
     time: String,
+    text: String,
+    /// the line this message answers, already shortened for the wire
+    quote: Option<String>,
+    style: Style,
+}
+
+/// one wrapped screen line, tied to the message it came from
+struct LogRow {
+    /// monotonic message number, survives old lines being dropped
+    seq: u64,
+    /// position in the log, used for lookups during the same draw
+    idx: usize,
     text: String,
     style: Style,
 }
@@ -132,8 +149,16 @@ pub struct App {
     /// peer id and nickname, the id keeps the colour stable
     peers: Vec<(String, String)>,
     topic: String,
+    /// monotonic id handed to every log line
+    next_seq: u64,
     /// screen row under the mouse, None while the pointer is elsewhere
     hover: Option<u16>,
+    /// message under the mouse, refreshed on every draw
+    hover_msg: Option<u64>,
+    /// line waiting to be quoted by the next message
+    reply: Option<String>,
+    /// last left click, for spotting a double click
+    last_click: Option<(Instant, u16)>,
     dirty: bool,
 }
 
@@ -148,23 +173,37 @@ impl App {
             scroll: 0,
             peers: Vec::new(),
             topic: String::new(),
+            next_seq: 1,
             hover: None,
+            hover_msg: None,
+            reply: None,
+            last_click: None,
             dirty: true,
         };
         app.push_system(format!(
             "group {:06} on udp port {}, share the code with people on your network",
             code, port
         ));
-        app.push_system("enter sends, /help shows commands, ctrl+c quits".to_string());
+        app.push_system(
+            "enter sends, /help shows commands, double click a message replies, ctrl+c quits"
+                .to_string(),
+        );
         app
     }
 
     fn push_msg(&mut self, text: String, style: Style) {
+        self.push_line(text, None, style)
+    }
+
+    fn push_line(&mut self, text: String, quote: Option<String>, style: Style) {
         self.lines.push(ChatMsg {
+            seq: self.next_seq,
             time: Local::now().format("%H:%M").to_string(),
             text,
+            quote,
             style,
         });
+        self.next_seq += 1;
         if self.lines.len() > MAX_LINES {
             self.lines.drain(..MAX_LINES / 4);
         }
@@ -194,7 +233,8 @@ impl App {
                 } else {
                     format!("{}: {}", msg.nick, msg.text)
                 };
-                self.push_msg(line, Style::Peer(peer_color(&msg.peer)));
+                let quote = Some(msg.quote).filter(|q| !q.is_empty());
+                self.push_line(line, quote, Style::Peer(peer_color(&msg.peer)));
             }
             NetEvent::Peers(list) => {
                 self.peers = list;
@@ -209,6 +249,7 @@ impl App {
                 self.lines.clear();
                 self.peers.clear();
                 self.topic.clear();
+                self.reply = None;
                 self.scroll = 0;
                 self.push_system(format!("joined group {code:06} on udp port {port}"));
             }
@@ -268,6 +309,7 @@ impl App {
                     self.push_system("usage: /me action".to_string());
                     return false;
                 }
+                self.reply = None;
                 let _ = tx.send(OutCmd::Action(text.clone()));
                 self.push_msg(format!("* {} {}", self.nick, text), Style::Own);
                 self.scroll = 0;
@@ -296,6 +338,7 @@ impl App {
             }
             "clear" => {
                 self.lines.clear();
+                self.reply = None;
                 self.dirty = true;
             }
             "quit" => return true,
@@ -347,9 +390,13 @@ impl App {
                     self.scroll = 0;
                     return quit;
                 }
-                let _ = tx.send(OutCmd::Chat(text.clone()));
+                let quote = self.reply.take();
+                let _ = tx.send(OutCmd::Chat {
+                    text: text.clone(),
+                    quote: quote.clone().unwrap_or_default(),
+                });
                 // show it right away, the network thread sends in parallel
-                self.push_msg(format!("{}: {}", self.nick, text), Style::Own);
+                self.push_line(format!("{}: {}", self.nick, text), quote, Style::Own);
                 self.scroll = 0;
             }
             // scroll offsets are counted from the newest line, up goes back
@@ -370,7 +417,10 @@ impl App {
                 self.dirty = true;
             }
             KeyCode::Esc => {
-                self.input.clear();
+                // esc drops the pending quote first, the input is the next thing
+                if self.reply.take().is_none() {
+                    self.input.clear();
+                }
                 self.dirty = true;
             }
             _ => {}
@@ -407,6 +457,21 @@ impl App {
             self.input = text;
             self.dirty = true;
         }
+    }
+
+    /// takes the message under the pointer as the quote for the next one
+    fn start_reply(&mut self) {
+        let Some(seq) = self.hover_msg else {
+            return;
+        };
+        let Some(msg) = self.lines.iter().find(|line| line.seq == seq) else {
+            return;
+        };
+        if !matches!(msg.style, Style::Peer(_) | Style::Own) {
+            return;
+        }
+        self.reply = Some(cut(&msg.text, QUOTE_W));
+        self.dirty = true;
     }
 
     /// main loop, returns when the user quits or the terminal breaks
@@ -462,6 +527,20 @@ impl App {
                         self.scroll = self.scroll.saturating_sub(3);
                         self.dirty = true;
                     }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        // a click without a fresh Moved still points at the
+                        // row under the pointer, the next draw resolves it
+                        self.hover = Some(mouse.row);
+                        self.dirty = true;
+                        let now = Instant::now();
+                        let double = self.last_click.is_some_and(|(at, row)| {
+                            row == mouse.row && now.duration_since(at) <= DOUBLE_CLICK
+                        });
+                        self.last_click = if double { None } else { Some((now, mouse.row)) };
+                        if double {
+                            self.start_reply();
+                        }
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -505,10 +584,25 @@ impl App {
 
         // wrapping happens for the whole log on every redraw, the log is
         // capped at MAX_LINES so this stays cheap
-        let mut chat: Vec<(usize, String)> = Vec::new();
+        let mut chat: Vec<LogRow> = Vec::new();
         for (idx, msg) in self.lines.iter().enumerate() {
+            if let Some(quote) = &msg.quote {
+                for line in wrap(quote, content_w.saturating_sub(3)) {
+                    chat.push(LogRow {
+                        seq: msg.seq,
+                        idx,
+                        text: format!(" │ {line}"),
+                        style: Style::Dim,
+                    });
+                }
+            }
             for chunk in wrap(&msg.text, content_w) {
-                chat.push((idx, format!(" {chunk}")));
+                chat.push(LogRow {
+                    seq: msg.seq,
+                    idx,
+                    text: format!(" {chunk}"),
+                    style: msg.style,
+                });
             }
         }
 
@@ -527,15 +621,16 @@ impl App {
             .hover
             .map(usize::from)
             .filter(|row| *row >= chat_top && *row < chat_top + visible.len());
-        let hovered = hover_row.map(|row| visible[row - chat_top].0);
+        let hovered = hover_row.map(|row| visible[row - chat_top].seq);
+        self.hover_msg = hovered;
 
         for _ in 0..blanks {
             frame.push(Row::plain(String::new(), Style::Dim));
         }
-        for (offset, (idx, text)) in visible.iter().enumerate() {
-            let msg = &self.lines[*idx];
-            if Some(*idx) != hovered {
-                frame.push(Row::plain(text.clone(), msg.style));
+        for (offset, row) in visible.iter().enumerate() {
+            let msg = &self.lines[row.idx];
+            if Some(row.seq) != hovered {
+                frame.push(Row::plain(row.text.clone(), row.style));
                 continue;
             }
 
@@ -549,16 +644,22 @@ impl App {
             } else {
                 width
             };
-            let body = cut(text, keep);
+            let body = cut(&row.text, keep);
             let pad = keep.saturating_sub(visible_width(&body));
-            let mut parts = vec![(body, msg.style), (" ".repeat(pad), Style::Dim)];
+            let mut parts = vec![(body, row.style), (" ".repeat(pad), Style::Dim)];
             if on_pointer {
                 parts.push((stamp, Style::Dim));
             }
             frame.push(Row { parts, hover: true });
         }
 
-        let hint = hint_for(&self.input).unwrap_or_default();
+        let hint = if self.input.starts_with('/') {
+            hint_for(&self.input).unwrap_or_default()
+        } else if let Some(quote) = &self.reply {
+            format!(" replying to {quote}  (esc cancels)")
+        } else {
+            String::new()
+        };
         frame.push(Row::plain(fit(&hint, width), Style::Dim));
 
         let tail = tail_fit(&self.input, width.saturating_sub(3));

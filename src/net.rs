@@ -174,9 +174,10 @@ pub fn net_run(config: Config, tx: Sender<NetEvent>, rx: Receiver<OutCmd>, stop:
         // the next incoming packet, which happens up to READ_TIMEOUT later
         loop {
             match rx.try_recv() {
-                Ok(OutCmd::Chat(text)) => {
+                Ok(OutCmd::Chat { text, quote }) => {
                     let id = random_id();
-                    let pkt = packet(&my_id, &my_nick, "msg", &id, &text);
+                    let mut pkt = packet(&my_id, &my_nick, "msg", &id, &text);
+                    pkt.quote = quote;
                     send_reliable(&socket, dest, &mut pending, &peers, pkt, &text);
                 }
                 Ok(OutCmd::Action(text)) => {
@@ -304,6 +305,7 @@ pub fn net_run(config: Config, tx: Sender<NetEvent>, rx: Receiver<OutCmd>, stop:
                                 nick: nick.clone(),
                                 id: pkt.id.clone(),
                                 text,
+                                quote: clean_text(&pkt.quote),
                                 action: pkt.kind == "action",
                             }));
                         }
