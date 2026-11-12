@@ -38,18 +38,15 @@ jobs:
         if: runner.os != 'Windows'
         run: strip target/release/mesrs
 
-      - name: pack
-        if: runner.os != 'Windows'
+      - name: stage
+        shell: bash
         run: |
           mkdir -p dist
-          tar -czf "dist/mesrs-${{ matrix.name }}.tar.gz" -C target/release mesrs
-
-      - name: pack
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path target/release/mesrs.exe -DestinationPath "dist/mesrs-${{ matrix.name }}.zip"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/release/mesrs.exe "dist/mesrs-${{ matrix.name }}.exe"
+          else
+            cp target/release/mesrs "dist/mesrs-${{ matrix.name }}"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -74,6 +71,21 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: pack release assets
+        run: |
+          mkdir -p assets
+          for file in dist/*; do
+            name=$(basename "$file")
+            case "$name" in
+              *.exe)
+                (cd dist && zip -q "../assets/${name%.exe}.zip" "$name")
+                ;;
+              *)
+                tar -czf "assets/$name.tar.gz" -C dist "$name"
+                ;;
+            esac
+          done
+
       - name: collect commits
         run: |
           prev=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
@@ -92,4 +104,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --notes-file notes.md \
-            dist/*
+            assets/*
