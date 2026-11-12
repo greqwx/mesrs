@@ -79,6 +79,21 @@ pub fn fit(text: &str, width: usize) -> String {
     out
 }
 
+/// cuts a string to `width` columns, no padding
+pub fn cut(text: &str, width: usize) -> String {
+    let mut out = String::with_capacity(width);
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = char_width(ch);
+        if used + w > width {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
+}
+
 /// keeps the end of a long input line visible, the start is scrolled off
 pub fn tail_fit(text: &str, width: usize) -> String {
     let mut used = 0;

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use crossterm::{cursor, execute, terminal};
+use crossterm::{cursor, event, execute, terminal};
 
 use crate::net::Config;
 use crate::protocol::{group_for, parse_code, random_id};
@@ -77,7 +77,12 @@ fn run() -> io::Result<()> {
     let mut out = io::stdout();
     shutdown::install();
     terminal::enable_raw_mode()?;
-    execute!(out, terminal::EnterAlternateScreen, cursor::Show)?;
+    execute!(
+        out,
+        terminal::EnterAlternateScreen,
+        cursor::Show,
+        event::EnableMouseCapture
+    )?;
 
     let net_stop = Arc::clone(&stop);
     let config = Config {
@@ -103,7 +108,12 @@ fn run() -> io::Result<()> {
 fn restore_terminal() {
     let _ = terminal::disable_raw_mode();
     let mut out = io::stdout();
-    let _ = execute!(out, cursor::Show, terminal::LeaveAlternateScreen);
+    let _ = execute!(
+        out,
+        cursor::Show,
+        event::DisableMouseCapture,
+        terminal::LeaveAlternateScreen
+    );
 }
 
 fn print_help() {

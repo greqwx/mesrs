@@ -10,19 +10,31 @@ use std::io::{self, Stdout, Write};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
+use chrono::Local;
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+};
+use crossterm::style::{
+    Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor,
+};
 use crossterm::terminal::{self, ClearType};
 use crossterm::{cursor, queue};
 
 use crate::protocol::{NetEvent, OutCmd, parse_code};
 use crate::shutdown;
-use crate::text::{MAX_TEXT, clean_text, fit, sanitize_nick, tail_fit, visible_width, wrap};
+use crate::text::{MAX_TEXT, clean_text, cut, fit, sanitize_nick, tail_fit, visible_width, wrap};
 
 /// how long the ui sleeps between checks of the network channel
 const POLL: Duration = Duration::from_millis(100);
 /// old lines are dropped past this point to keep memory flat
 const MAX_LINES: usize = 1000;
+/// background of the row under the mouse, a couple of shades above black so
+/// it reads as a hint rather than a selection
+const HOVER_BG: Color = Color::Rgb {
+    r: 36,
+    g: 36,
+    b: 36,
+};
 
 struct Command {
     name: &'static str,
@@ -75,8 +87,25 @@ const COMMANDS: [Command; 8] = [
 ];
 
 struct ChatMsg {
+    time: String,
     text: String,
     style: Style,
+}
+
+/// one screen row, built from segments so a line can mix styles, plus the
+/// flag that paints the hover background across the whole width
+struct Row {
+    parts: Vec<(String, Style)>,
+    hover: bool,
+}
+
+impl Row {
+    fn plain(text: String, style: Style) -> Self {
+        Row {
+            parts: vec![(text, style)],
+            hover: false,
+        }
+    }
 }
 
 /// who a line belongs to, the whole line gets one colour
@@ -84,7 +113,6 @@ struct ChatMsg {
 enum Style {
     Header,
     Dim,
-    Normal,
     Input,
     Own,
     Peer(Color),
@@ -104,6 +132,8 @@ pub struct App {
     /// peer id and nickname, the id keeps the colour stable
     peers: Vec<(String, String)>,
     topic: String,
+    /// screen row under the mouse, None while the pointer is elsewhere
+    hover: Option<u16>,
     dirty: bool,
 }
 
@@ -118,6 +148,7 @@ impl App {
             scroll: 0,
             peers: Vec::new(),
             topic: String::new(),
+            hover: None,
             dirty: true,
         };
         app.push_system(format!(
@@ -129,7 +160,11 @@ impl App {
     }
 
     fn push_msg(&mut self, text: String, style: Style) {
-        self.lines.push(ChatMsg { text, style });
+        self.lines.push(ChatMsg {
+            time: Local::now().format("%H:%M").to_string(),
+            text,
+            style,
+        });
         if self.lines.len() > MAX_LINES {
             self.lines.drain(..MAX_LINES / 4);
         }
@@ -410,6 +445,25 @@ impl App {
                     }
                 }
                 Event::Resize(_, _) => self.dirty = true,
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::Moved => {
+                        if self.hover != Some(mouse.row) {
+                            self.hover = Some(mouse.row);
+                            self.dirty = true;
+                        }
+                    }
+                    // the wheel would otherwise do nothing, mouse capture turns
+                    // off the terminal's own alternate screen scrolling
+                    MouseEventKind::ScrollUp => {
+                        self.scroll += 3;
+                        self.dirty = true;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.scroll = self.scroll.saturating_sub(3);
+                        self.dirty = true;
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -424,7 +478,7 @@ impl App {
         // one column is lost to the left indent, one stays as a right margin
         let content_w = width - 2;
 
-        let mut frame: Vec<(String, Style)> = Vec::with_capacity(height);
+        let mut frame: Vec<Row> = Vec::with_capacity(height);
 
         let mut header = format!(
             " mesrs  #{:06}  you: {}  {} online",
@@ -435,7 +489,7 @@ impl App {
         if self.scroll > 0 {
             header.push_str(&format!("  up {}", self.scroll));
         }
-        frame.push((fit(&header, width), Style::Header));
+        frame.push(Row::plain(fit(&header, width), Style::Header));
 
         let online = if self.peers.is_empty() {
             "waiting for someone to join".to_string()
@@ -447,14 +501,14 @@ impl App {
         } else {
             format!(" topic: {}  |  {online}", self.topic)
         };
-        frame.push((fit(&peer_line, width), Style::Dim));
+        frame.push(Row::plain(fit(&peer_line, width), Style::Dim));
 
         // wrapping happens for the whole log on every redraw, the log is
         // capped at MAX_LINES so this stays cheap
-        let mut chat: Vec<(String, Style)> = Vec::new();
-        for msg in &self.lines {
+        let mut chat: Vec<(usize, String)> = Vec::new();
+        for (idx, msg) in self.lines.iter().enumerate() {
             for chunk in wrap(&msg.text, content_w) {
-                chat.push((format!(" {chunk}"), msg.style));
+                chat.push((idx, format!(" {chunk}")));
             }
         }
 
@@ -464,41 +518,83 @@ impl App {
         let end = chat.len().saturating_sub(scroll);
         let start = end.saturating_sub(chat_h);
         let visible = &chat[start..end];
-        // blank rows go on top so messages sit right above the hint line
-        for _ in 0..chat_h.saturating_sub(visible.len()) {
-            frame.push((String::new(), Style::Normal));
+
+        // blank rows sit on top of the log so messages stay above the hint
+        // line, which puts the first message at chat_top
+        let blanks = chat_h.saturating_sub(visible.len());
+        let chat_top = 2 + blanks;
+        let hover_row = self
+            .hover
+            .map(usize::from)
+            .filter(|row| *row >= chat_top && *row < chat_top + visible.len());
+        let hovered = hover_row.map(|row| visible[row - chat_top].0);
+
+        for _ in 0..blanks {
+            frame.push(Row::plain(String::new(), Style::Dim));
         }
-        for row in visible {
-            frame.push(row.clone());
+        for (offset, (idx, text)) in visible.iter().enumerate() {
+            let msg = &self.lines[*idx];
+            if Some(*idx) != hovered {
+                frame.push(Row::plain(text.clone(), msg.style));
+                continue;
+            }
+
+            // a highlighted row is padded to the edge, and on the row under
+            // the pointer the stamp takes the last columns; the text is cut
+            // there instead of pushing the stamp onto a row of its own
+            let on_pointer = Some(chat_top + offset) == hover_row;
+            let stamp = format!(" {}", msg.time);
+            let keep = if on_pointer {
+                width.saturating_sub(visible_width(&stamp))
+            } else {
+                width
+            };
+            let body = cut(text, keep);
+            let pad = keep.saturating_sub(visible_width(&body));
+            let mut parts = vec![(body, msg.style), (" ".repeat(pad), Style::Dim)];
+            if on_pointer {
+                parts.push((stamp, Style::Dim));
+            }
+            frame.push(Row { parts, hover: true });
         }
 
         let hint = hint_for(&self.input).unwrap_or_default();
-        frame.push((fit(&hint, width), Style::Dim));
+        frame.push(Row::plain(fit(&hint, width), Style::Dim));
 
         let tail = tail_fit(&self.input, width.saturating_sub(3));
-        frame.push((format!("> {tail}"), Style::Input));
+        frame.push(Row::plain(format!("> {tail}"), Style::Input));
 
         queue!(out, cursor::MoveTo(0, 0))?;
-        for (y, (text, style)) in frame.iter().enumerate() {
+        for (y, row) in frame.iter().enumerate() {
             queue!(
                 out,
                 cursor::MoveTo(0, y as u16),
                 terminal::Clear(ClearType::CurrentLine)
             )?;
-            match style {
-                Style::Header => queue!(out, SetAttribute(Attribute::Reverse))?,
-                Style::Dim | Style::System => queue!(out, SetAttribute(Attribute::Dim))?,
-                Style::Own => queue!(out, SetForegroundColor(Color::Green))?,
-                Style::Peer(color) => queue!(out, SetForegroundColor(*color))?,
-                Style::Error => queue!(out, SetForegroundColor(Color::Red))?,
-                Style::Normal | Style::Input => {}
+            if row.hover {
+                queue!(out, SetBackgroundColor(HOVER_BG))?;
             }
-            queue!(
-                out,
-                Print(text.as_str()),
-                SetAttribute(Attribute::Reset),
-                ResetColor
-            )?;
+            for (text, style) in &row.parts {
+                match style {
+                    Style::Header => queue!(out, SetAttribute(Attribute::Reverse))?,
+                    Style::Dim | Style::System => queue!(out, SetAttribute(Attribute::Dim))?,
+                    Style::Own => queue!(out, SetForegroundColor(Color::Green))?,
+                    Style::Peer(color) => queue!(out, SetForegroundColor(*color))?,
+                    Style::Error => queue!(out, SetForegroundColor(Color::Red))?,
+                    Style::Input => {}
+                }
+                // reset per segment keeps attributes from leaking, but the
+                // background is set for the whole row and must survive
+                queue!(
+                    out,
+                    Print(text.as_str()),
+                    SetAttribute(Attribute::Reset),
+                    SetForegroundColor(Color::Reset)
+                )?;
+            }
+            if row.hover {
+                queue!(out, SetBackgroundColor(Color::Reset))?;
+            }
         }
 
         let cursor_x = 2 + visible_width(&tail);
