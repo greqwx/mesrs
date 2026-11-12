@@ -9,13 +9,13 @@ pub const MAX_TEXT: usize = 500;
 /// byte cap, a string of wide characters must not push a packet over the limit
 const MAX_TEXT_BYTES: usize = 900;
 
-/// removes control characters, trims and caps the nickname
+/// removes control characters, turns whitespace into underscores, trims and
+/// caps the nickname
 pub fn sanitize_nick(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .trim()
+    raw.trim()
         .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if c.is_whitespace() { '_' } else { c })
         .take(16)
         .collect()
 }
@@ -49,6 +49,32 @@ pub fn clean_text(raw: &str) -> String {
         count += 1;
     }
     out.trim().to_string()
+}
+
+/// true when `text` mentions `nick` as `@nick`
+///
+/// the comparison ignores case and needs a clean boundary after the name, so
+/// `@greg` does not match a nick `gregory`
+pub fn mentions(text: &str, nick: &str) -> bool {
+    let nick = nick.to_lowercase();
+    if nick.is_empty() {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    let mut from = 0;
+    while let Some(at) = lower[from..].find('@') {
+        let start = from + at + 1;
+        let end = lower[start..]
+            .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-' || c == '.'))
+            .map_or(lower.len(), |offset| start + offset);
+        let token = &lower[start..end];
+        // a dot or dash at the end is usually punctuation, not the nick
+        if token == nick || token.trim_end_matches(['.', '-']) == nick {
+            return true;
+        }
+        from = start;
+    }
+    false
 }
 
 /// terminal columns a string occupies, wide chars count as two

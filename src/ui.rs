@@ -22,7 +22,9 @@ use crossterm::{cursor, queue};
 
 use crate::protocol::{NetEvent, OutCmd, parse_code};
 use crate::shutdown;
-use crate::text::{MAX_TEXT, clean_text, cut, fit, sanitize_nick, tail_fit, visible_width, wrap};
+use crate::text::{
+    MAX_TEXT, clean_text, cut, fit, mentions, sanitize_nick, tail_fit, visible_width, wrap,
+};
 
 /// how long the ui sleeps between checks of the network channel
 const POLL: Duration = Duration::from_millis(100);
@@ -159,6 +161,8 @@ pub struct App {
     reply: Option<String>,
     /// last left click, for spotting a double click
     last_click: Option<(Instant, u16)>,
+    /// a mention arrived, beep once on the next draw
+    ring: bool,
     dirty: bool,
 }
 
@@ -178,6 +182,7 @@ impl App {
             hover_msg: None,
             reply: None,
             last_click: None,
+            ring: false,
             dirty: true,
         };
         app.push_system(format!(
@@ -185,7 +190,7 @@ impl App {
             code, port
         ));
         app.push_system(
-            "enter sends, /help shows commands, double click a message replies, ctrl+c quits"
+            "enter sends, /help shows commands, @nick pings, double click a message replies, ctrl+c quits"
                 .to_string(),
         );
         app
@@ -228,6 +233,7 @@ impl App {
                 if self.seen.len() > 5000 {
                     self.seen.clear();
                 }
+                let ping = mentions(&msg.text, &self.nick);
                 let line = if msg.action {
                     format!("* {} {}", msg.nick, msg.text)
                 } else {
@@ -235,6 +241,7 @@ impl App {
                 };
                 let quote = Some(msg.quote).filter(|q| !q.is_empty());
                 self.push_line(line, quote, Style::Peer(peer_color(&msg.peer)));
+                self.ring |= ping;
             }
             NetEvent::Peers(list) => {
                 self.peers = list;
@@ -706,6 +713,12 @@ impl App {
                 (height - 1) as u16
             )
         )?;
+        // the terminal turns the bell into its own sound or flash, which is
+        // all the notification this app needs for a mention
+        if self.ring {
+            queue!(out, Print('\u{7}'))?;
+            self.ring = false;
+        }
         out.flush()
     }
 }
